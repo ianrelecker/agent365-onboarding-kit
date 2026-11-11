@@ -1,0 +1,22 @@
+# Secrets — never commit real values
+.env
+*.local.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store/
+
+# Terraform/Bicep build output (if the infra folder grows)
+.terraform/
+*.tfstate*
+bicep-out/
