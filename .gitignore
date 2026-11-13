@@ -20,3 +20,12 @@ build/
 .terraform/
 *.tfstate*
 bicep-out/
+
+# Tests and local credentials
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.pem
+*.pfx
+*.key

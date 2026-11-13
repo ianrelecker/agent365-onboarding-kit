@@ -1,23 +1,43 @@
-// entra-agent-blueprint.bicep
+// Supporting Azure resources for an Agent 365 agent identity.
 //
-// What Bicep CAN express on the road to an Agent 365 agent identity:
-// the supporting Azure-side resources (a Key Vault for the agent's credential,
-// with access locked to the operator group). What Bicep CANNOT express:
-// the Entra agent identity blueprint and agent identity themselves — those are
-// Microsoft Graph constructs, not ARM resources. Create them with
-// scripts/Register-Agent365.ps1 (Graph PowerShell SDK). This file deliberately
-// stops at the boundary instead of faking a resource type that doesn't exist.
+// Bicep creates the credential boundary the blueprint federates to: a
+// user-assigned managed identity, and a Key Vault for anything else the agent
+// must read. It does not create the Entra agent identity blueprint. That is a
+// Graph object. scripts/Register-Agent365.ps1 creates it and attaches a
+// federated credential whose subject is this managed identity's principal id.
+//
+// The vault is created closed: RBAC authorization, purge protection, no
+// trusted-services bypass, and public network access disabled unless you opt
+// in. Purge protection cannot be turned off later.
 
 targetScope = 'resourceGroup'
 
-@description('Short name for the agent, used to name supporting resources. Lowercase letters and digits.')
+@description('Short name for the agent. 3-17 lowercase letters and digits, used in resource names. Key Vault rejects anything else.')
+@minLength(3)
+@maxLength(17)
 param agentName string
 
 @description('Azure region for supporting resources.')
 param location string = resourceGroup().location
 
-@description('Object ID of the Entra group allowed to read the agent credential from Key Vault (e.g. the agent operators group).')
+@description('Object ID of the Entra group allowed to administer secrets in this vault.')
 param operatorsGroupObjectId string
+
+@description('Enabled keeps a public endpoint. Disabled is the production default. Either way, the firewall default action is Deny.')
+@allowed([
+  'Enabled'
+  'Disabled'
+])
+param publicNetworkAccess string = 'Disabled'
+
+@description('IPv4 CIDR ranges allowed to reach the vault when public network access is Enabled. Example: 203.0.113.10/32.')
+param allowedIpAddresses array = []
+
+@description('Subnet resource ID for a private endpoint. Leave empty to skip the private endpoint. Private DNS for privatelink.vaultcore.azure.net is still required and is not created here.')
+param privateEndpointSubnetId string = ''
+
+@description('Log Analytics workspace resource ID for Key Vault AuditEvent logs. Leave empty to skip diagnostics.')
+param logAnalyticsWorkspaceId string = ''
 
 @description('Tags applied to supporting resources.')
 param tags object = {
@@ -25,8 +45,17 @@ param tags object = {
   agent: agentName
 }
 
+var uniqueSuffix = take(uniqueString(resourceGroup().id, agentName), 8)
+var keyVaultName = 'kva365${take(agentName, 10)}${uniqueSuffix}'
+
+resource managedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: 'id-a365-${agentName}'
+  location: location
+  tags: tags
+}
+
 resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
-  name: 'kv-a365-${agentName}'
+  name: keyVaultName
   location: location
   tags: tags
   properties: {
@@ -36,18 +65,23 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
     }
     tenantId: subscription().tenantId
     enableRbacAuthorization: true
-    // The agent identity's client secret/certificate lives here — never in the
-    // repo, never in app settings in plain text. The agent reads it at runtime
-    // via its (human-managed bootstrap) identity, or you inject it via your
-    // deployment pipeline's secret store integration.
+    enableSoftDelete: true
+    softDeleteRetentionInDays: 90
+    enablePurgeProtection: true
+    publicNetworkAccess: publicNetworkAccess
+    enabledForDeployment: false
+    enabledForDiskEncryption: false
+    enabledForTemplateDeployment: false
+    networkAcls: {
+      defaultAction: 'Deny'
+      bypass: 'None'
+      ipRules: [for ip in allowedIpAddresses: {
+        value: ip
+      }]
+    }
   }
 }
 
-// Key Vault Secrets Officer for the operators group (humans who rotate the
-// agent credential). The agent itself gets Secrets User via a separate
-// assignment once its identity exists — that assignment is created by the
-// registration script because the identity's principal ID doesn't exist yet
-// at template time.
 resource kvSecretsOfficer 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(keyVault.id, operatorsGroupObjectId, 'secrets-officer')
   scope: keyVault
@@ -61,6 +95,58 @@ resource kvSecretsOfficer 'Microsoft.Authorization/roleAssignments@2022-04-01' =
   }
 }
 
+resource kvSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(keyVault.id, managedIdentity.id, 'secrets-user')
+  scope: keyVault
+  properties: {
+    principalId: managedIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      '4633458b-17de-408a-b874-0445c86b69e6' // Key Vault Secrets User
+    )
+  }
+}
+
+resource privateEndpoint 'Microsoft.Network/privateEndpoints@2023-11-01' = if (!empty(privateEndpointSubnetId)) {
+  name: 'pe-${keyVaultName}'
+  location: location
+  tags: tags
+  properties: {
+    subnet: {
+      id: privateEndpointSubnetId
+    }
+    privateLinkServiceConnections: [
+      {
+        name: 'vault'
+        properties: {
+          privateLinkServiceId: keyVault.id
+          groupIds: [
+            'vault'
+          ]
+        }
+      }
+    ]
+  }
+}
+
+resource vaultDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = if (!empty(logAnalyticsWorkspaceId)) {
+  name: 'diag-${keyVaultName}'
+  scope: keyVault
+  properties: {
+    workspaceId: logAnalyticsWorkspaceId
+    logs: [
+      {
+        category: 'AuditEvent'
+        enabled: true
+      }
+    ]
+  }
+}
+
 output keyVaultName string = keyVault.name
 output keyVaultUri string = keyVault.properties.vaultUri
-output nextStep string = 'Now run scripts/Register-Agent365.ps1 to create the agent identity blueprint + identity in Entra ID (Graph), then store the credential in this vault.'
+output managedIdentityClientId string = managedIdentity.properties.clientId
+output managedIdentityPrincipalId string = managedIdentity.properties.principalId
+output publicNetworkAccess string = publicNetworkAccess
+output nextStep string = 'Run scripts/Register-Agent365.ps1 with -ManagedIdentityPrincipalId and -ManagedIdentityClientId from these outputs. The vault stays closed until you add a private endpoint and private DNS, or explicitly enable public access with allowed IP ranges.'
