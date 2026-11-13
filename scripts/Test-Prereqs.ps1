@@ -1,14 +1,15 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Prerequisite checker for Agent 365 onboarding of a third-party agent.
 
 .DESCRIPTION
-    Verifies what a script can verify (Graph connection, your roles) and prints
-    a checklist for what it cannot (licensing, Defender for Endpoint coverage,
-    sponsor choice). Run this before Register-Agent365.ps1.
+    Verifies what a script can verify (PowerShell 7, Graph module, connection,
+    delegated scopes, and whether your active roles are sufficient) and prints
+    the checklist no script can verify. Run this before Register-Agent365.ps1.
 
-    Exit code 0 = scriptable checks passed (checklist may still have manual
-    items). Exit code 1 = a scriptable check failed.
+    Exit 0 means the scriptable checks passed. The manual checklist can still
+    block a rollout. Exit 1 means a scriptable check failed.
 
 .EXAMPLE
     ./Test-Prereqs.ps1
@@ -16,59 +17,102 @@
 [CmdletBinding()]
 param()
 
-$failures = @()
+$ErrorActionPreference = 'Stop'
+$failures = [System.Collections.Generic.List[string]]::new()
 
 Write-Host "`n=== Scriptable checks ===" -ForegroundColor Cyan
 
-# Graph connection ----------------------------------------------------------
-try {
-    $ctx = Get-MgContext -ErrorAction Stop
-    if (-not $ctx) { throw "No Graph context. Run Connect-MgGraph first." }
-    Write-Host "[OK]   Connected to Graph as $($ctx.Account) (tenant $($ctx.TenantId))" -ForegroundColor Green
-    $needed = @('Organization.Read.All', 'Directory.Read.All')
-    $missing = $needed | Where-Object { $ctx.Scopes -notcontains $_ }
-    if ($missing) {
-        Write-Host "[WARN] Connected without: $($missing -join ', ') — some checks/steps may fail. Reconnect with the scopes Register-Agent365.ps1 requests." -ForegroundColor Yellow
-    }
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    $failures.Add('PowerShell 7 or newer is required.')
+    Write-Host "[FAIL] PowerShell $($PSVersionTable.PSVersion). Install PowerShell 7." -ForegroundColor Red
 }
-catch {
-    $failures += "Graph connection: $($_.Exception.Message)"
-    Write-Host "[FAIL] Graph connection: $($_.Exception.Message)" -ForegroundColor Red
+else {
+    Write-Host "[OK]   PowerShell $($PSVersionTable.PSVersion)" -ForegroundColor Green
 }
 
-# Signed-in user's roles ----------------------------------------------------
-# VERIFY: role display names for agent administration were still settling at
-# GA. This checks the two that unambiguously suffice; absence of both does not
-# prove you lack a sufficient agent-admin role in your tenant — check the
-# Entra admin center (Roles and administrators) before concluding anything.
-try {
-    $me = Get-MgUser -UserId 'me' -ErrorAction Stop
-    $roles = Get-MgUserMemberOf -UserId $me.Id -All -ErrorAction Stop |
-        Where-Object { $_.AdditionalProperties.displayName } |
-        ForEach-Object { $_.AdditionalProperties.displayName }
-    $sufficient = @('Global Administrator', 'Agent ID Administrator', 'Agent ID Admin')
-    $hit = $roles | Where-Object { $sufficient -contains $_ }
-    if ($hit) {
-        Write-Host "[OK]   Role(s) that suffice for blueprint/identity work: $($hit -join ', ')" -ForegroundColor Green
-    } else {
-        Write-Host "[WARN] None of ($($sufficient -join ', ')) found in your role memberships. You may hold an eligible role via PIM (not active) — activate it and re-run." -ForegroundColor Yellow
-    }
+if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
+    $failures.Add('Microsoft.Graph.Authentication is not installed.')
+    Write-Host '[FAIL] Microsoft Graph PowerShell SDK is not installed. Install-Module Microsoft.Graph -Scope CurrentUser' -ForegroundColor Red
 }
-catch {
-    Write-Host "[WARN] Could not enumerate roles: $($_.Exception.Message)" -ForegroundColor Yellow
+else {
+    Write-Host '[OK]   Microsoft.Graph.Authentication is installed' -ForegroundColor Green
+    Import-Module Microsoft.Graph.Authentication
 }
 
-Write-Host "`n=== Manual checklist (a script cannot verify these) ===" -ForegroundColor Cyan
+$needed = @(
+    'User.Read.All'
+    'AgentIdentityBlueprint.Read.All'
+    'AgentIdentityBlueprint.Create'
+    'AgentIdentityBlueprintPrincipal.Create'
+    'AgentIdentity.Read.All'
+    'AgentIdentity.Create.All'
+)
+
+if (Get-Command Get-MgContext -ErrorAction SilentlyContinue) {
+    try {
+        $ctx = Get-MgContext -ErrorAction Stop
+        if (-not $ctx) {
+            Write-Host '[WARN] Not connected to Graph yet. Register-Agent365.ps1 connects with the scopes it needs.' -ForegroundColor Yellow
+            $ctx = $null
+        }
+        else {
+            Write-Host "[OK]   Connected to Graph as $($ctx.Account) (tenant $($ctx.TenantId))" -ForegroundColor Green
+            $missing = @($needed | Where-Object { @($ctx.Scopes) -notcontains $_ })
+            if ($missing.Count) {
+                Write-Host "[WARN] Connected without: $($missing -join ', ')." -ForegroundColor Yellow
+                Write-Host '       Register-Agent365.ps1 will refuse to run until you reconnect with those scopes.' -ForegroundColor Yellow
+            }
+            else {
+                Write-Host '[OK]   Delegated scopes for blueprint, principal, and identity creation are present' -ForegroundColor Green
+            }
+            if (@($ctx.Scopes) -contains 'Directory.ReadWrite.All') {
+                Write-Host '[WARN] This connection still has Directory.ReadWrite.All. The registration script does not need it.' -ForegroundColor Yellow
+            }
+        }
+    }
+    catch {
+        $failures.Add("Graph connection: $($_.Exception.Message)")
+        Write-Host "[FAIL] Graph connection: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+Write-Host "`n=== Role check (active memberships only) ===" -ForegroundColor Cyan
+if ((Get-Command Invoke-MgGraphRequest -ErrorAction SilentlyContinue) -and (Get-MgContext -ErrorAction SilentlyContinue)) {
+    try {
+        $response = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.directoryRole?$select=displayName' -Headers @{ 'OData-Version' = '4.0' }
+        $names = @($response.value | ForEach-Object { $_.displayName })
+        $createRoles = @('Global Administrator', 'Agent ID Administrator', 'Agent ID Developer')
+        $secretRoles = @('Global Administrator', 'Agent ID Administrator')
+        $hit = @($names | Where-Object { $createRoles -contains $_ })
+        if ($hit.Count) {
+            Write-Host "[OK]   Active role(s) that can create blueprints: $($hit -join ', ')" -ForegroundColor Green
+        }
+        else {
+            Write-Host "[WARN] None of ($($createRoles -join ', ')) are active. Eligible PIM roles do not count until you activate them." -ForegroundColor Yellow
+        }
+        $secretHit = @($names | Where-Object { $secretRoles -contains $_ })
+        if (-not $secretHit.Count) {
+            Write-Host '[WARN] A client secret on a blueprint needs Agent ID Administrator or Global Administrator. Federated credentials can be added by Agent ID Developer.' -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Host "[WARN] Could not enumerate roles: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+Write-Host "`n=== Manual checklist ===" -ForegroundColor Cyan
 @(
-    "Licensing: Agent 365 assigned to the sponsor and to users who will interact with / manage this agent (standalone `$15/user/mo or via M365 E7). Enterprise standalone requires an M365 E5 base — confirm tenant eligibility in the current licensing FAQ.",
-    "Sponsor: a named, licensed, active human who will own this agent's alerts and access reviews.",
-    "Defender for Endpoint: onboarded on every device where this agent will run locally (endpoint discovery depends on it).",
-    "Secret store: a Key Vault (see infra/entra-agent-blueprint.bicep) or equivalent ready for the agent identity credential. Nothing secret goes in the repo.",
-    "Change window: Conditional Access for agents goes in report-only first; schedule enforcement outside business-critical hours."
+    'Licensing: an Agent 365 or Microsoft 365 E7 license is assigned to at least one user. A SKU that is only present in the tenant does not start telemetry ingestion.'
+    'Sponsor: a named, licensed, active human. The sample records that person''s Entra object id as user.id on every span.'
+    'Credential: a user-assigned managed identity federated to the blueprint, or a certificate. A client secret is a development-tenant shortcut.'
+    'Registry: the blueprint is registered with Agent 365 (Microsoft 365 Agents SDK or a365 setup all). An unregistered instance is rejected when it exports telemetry.'
+    'Defender for Endpoint is deployed on devices where this agent runs locally. That is what surfaces the process. It does not govern it.'
+    'Conditional Access for agents is report-only first, and it targets agent identities (includeAgentIdServicePrincipals), not includeApplications.'
+    'Key Vault from infra/entra-agent-blueprint.bicep has purge protection, RBAC, and a closed network. Turn on private DNS before the agent host depends on it.'
 ) | ForEach-Object { Write-Host "  [ ] $_" }
 
 if ($failures.Count) {
-    Write-Host "`nFAILED checks: $($failures.Count). Fix the [FAIL] items and re-run." -ForegroundColor Red
+    Write-Host "`nFAILED checks: $($failures.Count)." -ForegroundColor Red
     exit 1
 }
 Write-Host "`nScriptable checks passed. Work the manual checklist before registering." -ForegroundColor Green

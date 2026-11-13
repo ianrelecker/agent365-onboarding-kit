@@ -1,17 +1,36 @@
 {
   "version": 1,
-  "comment": "Tool governance for agents onboarded with this kit. Default deny: a tool that is not listed does not run. requires_approval tools are refused by unattended runtimes and routed to a human approval flow in production deployments.",
+  "comment": "Harness allowlist. Agent 365 does not read this file. Default deny: a tool that is not listed does not run. requires_approval is refused unless the caller passes an approval decision for that invocation. allowed false without requires_approval cannot be approved.",
   "default": "deny",
   "tools": {
     "get_weather": {
       "allowed": true,
       "requires_approval": false,
-      "comment": "Read-only, low-risk lookup. The kind of tool an agent should be able to use without waking a human."
+      "comment": "Read-only lookup. Safe to run unattended.",
+      "arguments": {
+        "location": {
+          "type": "string",
+          "required": true,
+          "max_length": 80
+        }
+      }
     },
     "send_external_email": {
       "allowed": false,
       "requires_approval": true,
-      "comment": "Outbound communication leaves the tenant boundary and cannot be unsent - a human approves each use, or the tool stays off."
+      "comment": "Outbound mail leaves the tenant and cannot be unsent. A human approves each use, or the tool stays off.",
+      "arguments": {
+        "to": {
+          "type": "string",
+          "required": true,
+          "max_length": 320
+        },
+        "body": {
+          "type": "string",
+          "required": true,
+          "max_length": 4000
+        }
+      }
     }
   }
 }

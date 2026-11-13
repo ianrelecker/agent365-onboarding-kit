@@ -1,109 +1,149 @@
 # Onboarding runbook — third-party agent → Agent 365 governance
 
-Each step gives you three ways to know you're done: the **portal path** (where it
-shows up), the **script path** (what automates it), and the **validation check**
-(how you prove it worked). Do them in order; identity problems poison everything
-downstream.
+Do these in order. An identity problem poisons telemetry, and telemetry that
+returns HTTP 200 can still have been rejected.
 
 ## Step 0 — Prerequisites
 
-- **Portal:** Microsoft 365 admin center → verify Agent 365 licensing is assigned
-  to the users who will sponsor/manage agents.
-- **Script:** `scripts/Test-Prereqs.ps1` — checks your Graph connection and roles,
-  and prints the checklist for the parts no script can verify (licenses present,
-  Defender for Endpoint onboarded on devices where local agents run).
-- **Validate:** the script's checklist is fully green, and you can name the human
-  sponsor for the agent you're onboarding.
+- **Portal:** Microsoft 365 admin center. Confirm an Agent 365 or Microsoft 365
+  E7 license is **assigned** to the sponsor, not merely purchased.
+- **Script:** `scripts/Test-Prereqs.ps1` on PowerShell 7, with the Microsoft
+  Graph PowerShell SDK installed.
+- **Validate:** you can name the sponsor, and you know which credential the
+  blueprint will use. Production default is the user-assigned managed identity
+  from `infra/entra-agent-blueprint.bicep`.
 
-Licensing reminders (verify against the current Microsoft licensing FAQ before a
-rollout): Agent 365 is per-user — $15/user/mo standalone or included in M365 E7
-($99). Enterprise standalone requires an M365 E5 base. Agents themselves need no
-license; the people who interact with, sponsor, or manage them do.
+Licensing reminders: Agent 365 is per user. Agents themselves need no license.
+The people who sponsor, use, or manage them do. Enterprise standalone Agent 365
+requires a Microsoft 365 E5 base. Confirm the current licensing FAQ before a
+rollout.
 
-## Step 1 — Create the Entra agent identity blueprint
+## Step 1 — Deploy the credential boundary
 
-An agent identity *blueprint* is the template; agent *identities* are created
-under it (think: app registration vs service principal, for agents).
+- **Script:** deploy `infra/entra-agent-blueprint.bicep` to a resource group.
+  It creates a user-assigned managed identity and a Key Vault with RBAC, purge
+  protection, and public network access disabled.
+- **Validate:** the deployment outputs `managedIdentityClientId` and
+  `managedIdentityPrincipalId`. The vault is not reachable from a laptop until
+  you add a private endpoint plus the `privatelink.vaultcore.azure.net` zone,
+  or you explicitly set `publicNetworkAccess` to `Enabled` and pass
+  `allowedIpAddresses`.
 
-- **Portal:** Microsoft Entra admin center → Identity → Agents (preview surfaces
-  move — search "agent identity blueprint").
-- **Script:** `scripts/Register-Agent365.ps1 -DisplayName "Contoso Support Agent"`
-  creates or reuses the blueprint idempotently.
-- **Validate:** the blueprint appears in the Entra admin center and the script
-  prints its object ID.
+Purge protection cannot be turned off after this deployment.
 
-## Step 2 — Assign the sponsor
+## Step 2 — Create the blueprint, the principal, and the identity
 
-The sponsor is the human accountable for the agent: they get its access reviews,
-its alerts, and the blame.
+An agent identity blueprint is the template and the credential holder. The
+blueprint principal is what Conditional Access targets when you want every
+identity minted from that blueprint. The agent identity is the account the
+process runs as. It has no credential of its own.
 
-- **Portal:** on the blueprint/agent identity → Sponsors → add the user.
-- **Script:** `Register-Agent365.ps1 -SponsorUpn sponsor@contoso.com`.
-- **Validate:** the sponsor is listed on the identity, and the sponsor is a
-  licensed, active user (not a shared mailbox, not someone on leave).
+- **Portal:** Entra admin center → Entra ID → Agents → Agent blueprints.
+- **Script:**
 
-## Step 3 — Create the agent identity and credentials
+```powershell
+./scripts/Register-Agent365.ps1 `
+  -DisplayName "Contoso Support Agent" `
+  -SponsorUpn "jane@contoso.com" `
+  -ManagedIdentityPrincipalId "<principal id from the deployment>" `
+  -ManagedIdentityClientId "<client id from the deployment>"
+```
 
-- **Script:** the same `Register-Agent365.ps1` run creates the agent identity
-  under the blueprint and prints its **object ID** and **client ID**. Create a
-  client secret (or, better, a certificate / federated credential) for it in the
-  portal and store it in your secret manager — never in the repo.
-- **Validate:** the client ID, copied into the agent's environment
-  (`AGENT365_CLIENT_ID`), acquires a token (step 5's demo/real run proves it).
+`-WhatIf` stops before any write. Re-running reuses the same display name and
+refuses to guess when two objects share it.
 
-## Step 4 — Register the agent instance
+- **Validate:** the script prints `BlueprintClientId`, `AgentClientId`,
+  `BlueprintPrincipalObjectId`, and `SponsorObjectId`. The sponsor is an
+  active user and is listed on both the blueprint and the identity.
 
-Registration is what puts the agent in the Agent 365 registry with its metadata,
-owner, and risk profile. The documented Graph surface for registry records is the
-beta agentRegistry API (`GET/PATCH /beta/agentRegistry/agentInstances`) — treat
-beta as beta: it can change, and fields should be verified against Microsoft
-Learn at implementation time.
+`-IssueDevelopmentSecret` prints a short-lived secret once. Do not use it for
+a production agent, and do not combine it with a managed identity.
 
-- **Portal:** Agent 365 admin experience → Agents → confirm your agent appears
-  after registration/sync.
-- **Validate:** the agent instance shows the right sponsor, blueprint, and
-  environment. If it shows up via registry sync *without* an Entra identity, you
-  have inventory, not governance — keep going.
+## Step 3 — Register the agent in Agent 365
+
+Entra identity is not the Agent 365 registry. Use the Microsoft 365 Agents SDK
+or `a365 setup all` so the instance is registered. An unregistered instance
+that exports on the service-to-service telemetry route is rejected.
+
+This repo does not call the beta Agent Registry. That surface has been in
+migration, and a stale POST is worse than a manual step you can see.
+
+- **Validate:** the agent appears in the Agent 365 admin experience with the
+  sponsor and the blueprint you just created. If it appears from a cloud sync
+  with no Entra identity, you have inventory, not governance.
+
+## Step 4 — Prove the token exchange
+
+The agent host needs:
+
+| Variable | Value |
+|---|---|
+| `AGENT365_TENANT_ID` | Tenant id from the script |
+| `AGENT365_BLUEPRINT_CLIENT_ID` | `BlueprintClientId` (blueprint appId) |
+| `AGENT365_AGENT_CLIENT_ID` | `AgentClientId` (agent identity appId, also `fmi_path`) |
+| `AGENT365_CALLER_OBJECT_ID` | `SponsorObjectId` for an autonomous run, otherwise the signed-in user's object id |
+| `AGENT365_MANAGED_IDENTITY_CLIENT_ID` | The managed identity client id, on the Azure host that owns that identity |
+
+Leave `AGENT365_CLIENT_SECRET` unset. The process refuses a secret unless
+`AGENT365_ALLOW_CLIENT_SECRET=true`, and that flag is a development opt-in.
+
+The exchange is two token requests: the blueprint presents its federated
+credential with `fmi_path` set to the agent identity appId, then the agent
+identity presents that token as a client assertion. Conditional Access applies
+to the second request, not to the blueprint's exchange at the AAD Token
+Exchange endpoint.
+
+- **Validate:** the sample prints `demo_mode=False` and does not print the
+  token. A failure names the token error without the secret or the assertion.
 
 ## Step 5 — Wire telemetry
 
-The sample agent (`src/sample_agent/telemetry.py`) emits OpenTelemetry spans —
-`agent.invoke`, `tool.call` — with attributes Agent 365 observability cares
-about: `agent.id`, `agent.blueprint.id`, `agent.sponsor`, `tool.name`,
-`tool.outcome`.
+Outside demo mode the sample posts OTLP/HTTP+JSON to:
 
-- **Script/config:** set `OTEL_EXPORTER_OTLP_ENDPOINT` to your collector/ingest
-  endpoint. Unset = console exporter (demo mode).
-- **Validate:** run the agent once, then find the run in the Agent 365
-  observability views. ⚠️ Telemetry is dropped if no licensed user is involved
-  in the flow — if spans don't land, check licensing before debugging code.
+```text
+https://agent365.svc.cloud.microsoft/observabilityService/tenants/{tenantId}/otlp/agents/{agentId}/traces?api-version=1
+```
 
-## Step 6 — Enforce tool governance
+`{agentId}` is the agent identity appId. Every span carries
+`gen_ai.operation.name`, `gen_ai.agent.id`, `microsoft.a365.agent.blueprint.id`,
+`microsoft.tenant.id`, `user.id`, `gen_ai.conversation.id`, and the other
+mandatory run attributes. Prompt text is redacted unless
+`AGENT365_TRACE_CONTENT=true`.
 
-Tool calls are checked against `policies/mcp-allowlist.json` **before**
-execution (`src/sample_agent/tool_governance.py`): default deny, per-tool
-`allowed` / `requires_approval` flags. Denied calls raise and are traced, so an
-attempted policy violation is itself telemetry.
+- **Validate:** the process exits `1` unless a sink status is `sent` and
+  none are `rejected`. HTTP 200 alone is not ingestion. A 200 whose sinks
+  are `not_routed`, or whose reason is `tenant_not_licensed`, is a routing
+  or licensing problem, not a span-shape problem. Then find the run in the
+  Agent 365 activity view.
 
-- **Validate:** ask the sample agent to use the approval-required tool in demo
-  mode. It must refuse, and the refusal must appear in the trace output.
+Demo mode (`python agent.py` with no identity variables) prints spans locally
+and does not call this endpoint.
 
-## Step 7 — Validate in the admin center
+## Step 6 — Enforce the local tool allowlist
 
-- Registry: agent present, correct identity/sponsor/environment.
-- Observability: a full run's spans are visible end-to-end.
-- Purview: the agent's activity appears in audit.
-- Defender: no unexpected alerts from a known-good run (baseline your noise
-  now, not during an incident).
+`policies/mcp-allowlist.json` is checked before the tool function runs.
+Default is deny. `requires_approval` does not run unless the caller passes an
+approval decision for that invocation. There is no environment variable that
+approves a tool. `allowed: false` without `requires_approval` cannot be
+approved.
 
-## Step 8 — Conditional Access for agents
+This file is not an Agent 365 policy. It binds the process you ship.
 
-Apply the template in `policies/conditional-access-for-agents.md` in
-**report-only mode first**, watch it for a full business cycle, then enforce.
-CA mistakes against agent identities break business processes at machine speed —
-report-only is not optional caution, it's the procedure.
+- **Validate:** `python agent.py "send the forecast"` exits `2`, does not
+  claim the mail was sent, and the `execute_tool` span says
+  `approval_required`.
+
+## Step 7 — Conditional Access
+
+Adapt `policies/conditional-access-for-agents.md`. Target
+`BlueprintPrincipalObjectId` with `includeAgentIdServicePrincipals`. Leave the
+policy in report-only until you have watched a business cycle. Do not put the
+agent's client id in `includeApplications`; that field is the resource being
+called.
 
 ## Rollback
 
-Disable the CA policy → revoke the agent identity's credentials → disable (don't
-delete) the agent identity. Deleting destroys the audit trail you may need.
+Disable the Conditional Access policy, revoke the blueprint credential
+(federated credential or secret), then disable the agent identity. Do not
+delete it if you still need the audit trail. Deleting the blueprint also
+deletes the identities created from it.

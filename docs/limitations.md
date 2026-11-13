@@ -31,10 +31,13 @@ disappointment with it comes from expecting it to be something else.
    through the SDK-style onboarding; unregistered use is shadow activity:
    visible, not governed.
 
-5. **Telemetry has a licensing tripwire.** If no Agent 365-licensed user is
-   involved in a flow, the SDK telemetry from that flow may be dropped. Design
-   flows so a licensed user (at minimum the sponsor/owner) is in the loop, and
-   verify ingestion in the admin center rather than assuming it.
+5. **Telemetry has a licensing tripwire.** An Agent 365 or Microsoft 365 E7
+   license has to be **assigned** to at least one user. A SKU that is only
+   present in the tenant is not enough: ingestion can return HTTP 200 while
+   `results` says every span was rejected. A 200 is not proof the run landed.
+   Spans also have to carry the mandatory attributes (`gen_ai.operation.name`,
+   `gen_ai.agent.id`, `microsoft.tenant.id`, `user.id`, and the rest of the
+   attribute reference). Missing ones are dropped.
 
 6. **Pre-GA agents may need republishing.** Agents created before GA don't all
    retroactively acquire Entra Agent IDs; expect to rebuild/republish some of
@@ -55,16 +58,30 @@ disappointment with it comes from expecting it to be something else.
 
 ## This kit
 
-- `scripts/Register-Agent365.ps1` targets the Microsoft Graph PowerShell SDK and
-  isolates preview-specific calls behind clearly marked TODO/verify comments.
-  Agent-identity Graph surfaces were still evolving at GA — expect to adjust the
-  adapter section against current Microsoft Learn docs on first use in a tenant.
-- The sample agent's LLM is a deterministic stub. The point is the governance
-  wiring (identity, telemetry, allowlist), which is real; the "intelligence" is
-  deliberately not.
-- The Bicep file covers only what Bicep can express. Agent identity blueprints
-  are a Graph-side construct; Bicep cannot create them directly, and the file
-  says so rather than pretending otherwise.
-- The Conditional Access template in `policies/` is a starting point to adapt
-  with your CA administrator — CA for agents has failure modes (locking out a
-  business process at 2 AM) that a template cannot foresee.
+- `scripts/Register-Agent365.ps1` calls the v1.0 agent identity blueprint,
+  blueprint principal, and agent identity APIs. It does not create a credential
+  unless you pass a managed identity or explicitly ask for a development
+  secret. Registry registration is still a separate step (the Microsoft 365
+  Agents SDK or `a365 setup all`). This script does not call the beta Agent
+  Registry, which Microsoft has been replacing.
+- The sample does not use the Microsoft OpenTelemetry Distro. It posts
+  OTLP/HTTP+JSON itself, which is the documented fallback, and it fails the
+  process unless Agent 365 marks a sink `sent` and marks none `rejected`.
+  A 200 with `rejectedSpans: 0` can still be a rejection. The recommended
+  path for a new agent that can take the dependency is the Distro.
+- Token acquisition follows the autonomous agent exchange: the blueprint
+  credential plus `fmi_path` set to the agent identity appId, then a second
+  call as the agent identity. A single client-credentials call as the agent
+  identity does not work, because the identity has no credential.
+- The sample agent's planner is a deterministic stub. Identity, telemetry, and
+  the allowlist are the parts that are real.
+- The allowlist is local. It is not an Agent 365 control. Turning it off in
+  this process does not turn on a server-side replacement.
+- The Bicep file creates the managed identity and a closed Key Vault. It
+  cannot create the blueprint. Purge protection, once deployed, cannot be
+  disabled. The firewall does not bypass Azure services. The template does
+  not create the private DNS zone the vault needs when public access is
+  disabled.
+- The Conditional Access template targets agent identities through
+  `includeAgentIdServicePrincipals`. It is report-only on purpose. Beta policy
+  JSON can drift; export the portal policy and prefer that if they disagree.

@@ -59,8 +59,8 @@ it the way this kit demonstrates:
 |---|---|
 | `docs/onboarding-runbook.md` | Step-by-step onboarding: prereqs → blueprint → sponsor → registration → telemetry → tool governance → validation → CA |
 | `docs/limitations.md` | What this kit (and Agent 365) does *not* do — read before promising anyone anything |
-| `infra/entra-agent-blueprint.bicep` | The slice of the registration Bicep can express; comments mark where Graph/PowerShell must finish the job |
-| `scripts/Register-Agent365.ps1` | Idempotent Graph SDK script: creates/gets the blueprint and agent identity, assigns the sponsor |
+| `infra/entra-agent-blueprint.bicep` | User-assigned managed identity plus a closed Key Vault. The blueprint itself is created by the Graph script |
+| `scripts/Register-Agent365.ps1` | Idempotent Graph script: blueprint, blueprint principal, agent identity, sponsor, optional federated credential |
 | `scripts/Test-Prereqs.ps1` | Prereq checker: Graph connection, roles, license/defender checklist |
 | `src/sample_agent/` | A runnable Python "third-party agent" wired for identity, telemetry, and tool governance |
 | `policies/mcp-allowlist.json` | Sample tool allowlist: one allowed tool, one approval-required tool, default deny |
@@ -74,14 +74,23 @@ pip install -r requirements.txt
 python agent.py "what's the weather in Reseda?"
 ```
 
-With no environment variables set, the sample runs in **demo mode**: a stub token
-stands in for the agent identity, telemetry goes to the console, and the tool
-governance layer still enforces `policies/mcp-allowlist.json` for real. Try asking
-it to do something with the approval-required tool and watch it refuse.
+With no `AGENT365_*` identity variables set, the sample runs in **demo mode**:
+a stub token stands in for the agent identity, spans print to the console, and
+the tool allowlist is still enforced. Ask it to send mail and it refuses.
+Exit codes are `0` (the tool ran), `2` (the allowlist refused it), and `1`
+(the run failed). A refusal is not a successful exit.
 
-To run it "for real" against a tenant, copy `.env.example` to `.env`, fill in the
-agent identity's client ID/secret and your tenant ID, and follow
-`docs/onboarding-runbook.md`.
+Copy `.env.example` to `.env` only when you are leaving demo mode. The process
+loads that file for variables that are not already set. A partial identity
+configuration is refused: demo mode is not a fallback for a missing tenant id,
+client id, or credential. Production authentication is the two-step blueprint
+exchange (`fmi_path`), using a managed identity or a certificate. A client
+secret is a development-tenant opt-in, not the production credential.
+
+The allowlist in `policies/mcp-allowlist.json` is enforced by this harness
+before a tool function runs. Agent 365 does not read that file. Conditional
+Access and Entra permissions govern tokens; the file governs the process.
+Follow `docs/onboarding-runbook.md` before pointing this at a tenant.
 
 ## Prerequisites
 
@@ -102,11 +111,12 @@ agent identity's client ID/secret and your tenant ID, and follow
 
 **Roles** (for the person running the scripts):
 
-- Global Administrator, or the Agent ID administrator role where your tenant exposes
-  it, for blueprint/identity creation.
+- Agent ID Developer can create a blueprint and a federated credential. Agent ID
+  Administrator (or Global Administrator) is required to add a client secret.
 - Conditional Access Administrator for the CA-for-agents policies.
-- The agent's **sponsor** must be a real, licensed user — pick someone who will
-  notice if the agent starts behaving strangely.
+- The agent's **sponsor** must be a real, licensed, active user — pick someone
+  who will notice if the agent starts behaving strangely. That person's object
+  id is `user.id` on autonomous spans. Agent 365 drops spans that omit it.
 
 ## Honest status — GA vs preview vs verify-before-use
 
